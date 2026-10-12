@@ -170,25 +170,41 @@ Training data is held in memory as arrays: about **150 bytes per row** (26 int32
 
 ## 5. Setup
 
-Requirements: Python 3.9+, and **Java 8/11/17** (needed by Spark).
+Requirements: Python 3.9+ (verified with 3.14) and **Java 17 or newer** (needed by Spark; PySpark 4 dropped Java 8 and 11, while PySpark 3.5 still works with Java 11). Always use a **fresh virtual environment**. These exact steps were verified on Ubuntu with Python 3.14, PySpark 4.2, PyTorch 2.14 and pandas 3.0:
 
-    python -m venv .venv && source .venv/bin/activate
+    cd ctr-prediction-spark
+    python3 -m venv .venv               # Debian/Ubuntu: sudo apt install python3-venv
+    source .venv/bin/activate
+    unset PYTHONPATH                    # an inherited PYTHONPATH overrides the venv
+    export PYTHONNOUSERSITE=1           # stops packages in ~/.local from leaking into the venv
     pip install -r requirements.txt
-    java -version        # must work, otherwise install a JDK
+    python -c "import pandas, torch; print(pandas.__file__)"   # path must be inside .venv
+    java -version                       # must work; otherwise: sudo apt install default-jre-headless
 
-Run the tests:
+Run the tests (about 10 seconds, 28 tests):
 
-    pytest -q                   # all tests (Spark test is skipped if Java is missing)
-    pytest -q -m "not slow"     # skip the Spark test
+    pytest -q -m "not slow"             # skips the Spark end-to-end test
+    pytest -q                           # all 29 tests (the Spark test is skipped if Java is missing)
+
+Notes:
+
+* Do all of the above in a **new terminal** after `unset PYTHONPATH` and `PYTHONNOUSERSITE` are set. `run_demo.sh` sets both again itself, but the venv must already be activated.
+* Debian/Ubuntu block `pip install` outside a venv (`externally-managed-environment`). Use the venv, not `--break-system-packages`.
+* The first install downloads several GB because PyTorch pulls in CUDA libraries. For a CPU-only install: `pip install torch --index-url https://download.pytorch.org/whl/cpu`, then `pip install -r requirements.txt`.
+* If you see `No module named 'pandas._libs...'`, packages from another Python version (`~/.local/lib/python3.x` or a `PYTHONPATH`) are being picked up. Run `echo $PYTHONPATH`, `unset` it, delete `.venv`, and repeat the steps above.
+* `deactivate: command not found` just means no venv was active; ignore it.
+* Activate the venv in every new terminal before running `run_demo.sh`.
 
 ---
 
 ## 6. Quick start
 
-    bash run_demo.sh                       # 500k synthetic rows, roughly 10-20 minutes
+    bash run_demo.sh                       # 500k synthetic rows
     N_ROWS=2000000 bash run_demo.sh        # bigger
 
-Outputs: `data/` (raw and Parquet), `runs/` (per-model predictions, metrics, weights), `results/` (tables and plots).
+Runtime: about 2 to 5 minutes on a recent laptop with a GPU (the neural models use CUDA automatically when available); expect 10 to 20 minutes on a 2-core CPU-only machine. Spark prints some warnings at start-up (see Troubleshooting); they are harmless.
+
+Outputs: `data/` (raw and Parquet), `runs/` (per-model predictions, metrics, weights), `results/` (tables and plots), `results/ablations/`.
 
 ---
 
@@ -317,6 +333,22 @@ Takeaways: larger embeddings help up to the largest size tried; a stricter rare 
 
 ---
 
+### 10.5 A second, independent run
+
+The same demo (`bash run_demo.sh`, 500k rows, GPU, Python 3.14, different random draws than the table above) gave the same picture, which shows the findings are not one-off:
+
+| model | test AUC | test log loss |
+|---|---|---|
+| LightGBM | 0.7239 | 0.5088 |
+| DCN-v2 | 0.7067 | 0.5190 |
+| DeepFM | 0.7060 | 0.5185 |
+| LR | 0.6992 | 0.5263 |
+| FM | 0.6931 | 0.5279 |
+
+Platt and isotonic cut ECE from about 0.017 to 0.035 down to about 0.007 to 0.015; COPC moved from about 1.04 to 1.09 to about 0.99. In the auction simulation, bidding on uncorrected probabilities lost 7 to 10 per 1,000 impressions, while corrected bids earned 10.5 to 11.6. Embedding size 32 beat 4 (0.7079 vs 0.7036 AUC), `min_count` of 50 to 200 was best, and more cross layers helped slightly. Exact numbers vary by hardware and seed, so judge by the ranking and the direction of each effect.
+
+---
+
 ## 11. Running on real Criteo
 
 1. Put `train.txt` somewhere with enough disk. Optionally take the first N rows: `head -n 5000000 train.txt > data/criteo_5m.tsv`.
@@ -333,11 +365,14 @@ Expect interaction models (DeepFM, DCN-v2) to overtake LR at millions of rows.
 
 | Problem | Fix |
 |---|---|
-| `JAVA_HOME is not set` / Spark fails to start | Install JDK 11 or 17; check `java -version` |
+| `No module named 'pandas._libs...'` / `externally-managed-environment` | Use a fresh venv with `PYTHONNOUSERSITE=1` (see Setup) |
+| `JAVA_HOME is not set` / Spark fails to start | Install JDK 17 or newer; check `java -version` |
+| Spark prints `WARN Utils: Your hostname ... resolves to a loopback address`, `jdk.incubator.vector`, `package sun.security.action not in java.base`, or `NativeCodeLoader` warnings | Harmless. Set `SPARK_LOCAL_IP=127.0.0.1` to silence the hostname one |
+| `FutureWarning: PySpark does not yet fully support pandas >= 3.0.0` | Harmless here: the pipeline only uses pandas outside Spark. Install `pandas<3` to silence it |
 | Spark out of memory | Raise `--driver-memory`; lower `--shuffle-partitions` for small data, raise it for big data |
 | Python out of memory when training | Use `--max-train-rows`; about 150 B per row |
 | FM or DeepFM overfits quickly | Lower `--emb-lr`, use a smaller `--batch-size`, raise `--min-count` |
-| Slow on CPU | Use fewer rows, fewer epochs, or `--device cuda` |
+| Slow on CPU | Use fewer rows, fewer epochs, or `--device cuda` (used automatically when a GPU is available) |
 | `pip install pyspark` conflicts | Use a clean virtualenv; match your Java version |
 | Auction numbers look wrong | `--neg-keep-rate` must match the downsampling of your data |
 
